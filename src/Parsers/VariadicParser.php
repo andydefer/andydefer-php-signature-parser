@@ -32,18 +32,43 @@ final class VariadicParser implements ParserInterface
                 $allowedString = trim($matches[2]);
                 $allowed = $allowedString !== '' ? StringTypedCollection::from(array_map('trim', explode(',', $allowedString))) : new StringTypedCollection;
 
-                $values = $this->extractVariadicValues($query, $queryIndex);
+                $values = [];
+                $foundVariadic = false;
 
-                // Advance index past the variadic token
+                // Parcourir les tokens pour trouver le variadic
                 for ($i = $queryIndex; $i < $queryCount; $i++) {
-                    if (str_starts_with($query[$i], '[') && str_ends_with($query[$i], ']')) {
+                    $current = $query[$i];
+
+                    if (str_starts_with($current, '[') && str_ends_with($current, ']')) {
+                        $content = trim($current, '[]');
+                        if (! empty($content)) {
+                            $parts = array_map('trim', explode(',', $content));
+                            foreach ($parts as $part) {
+                                if (! empty($part)) {
+                                    $values[] = $part;
+                                }
+                            }
+                        }
                         $queryIndex = $i + 1;
+                        $foundVariadic = true;
                         break;
                     }
+
+                    // Si on trouve un flag, on s'arrête et on ne consomme pas le flag
+                    if (str_starts_with($current, '--')) {
+                        break;
+                    }
+
+                    // Sinon on avance l'index
                     $queryIndex++;
                 }
 
-                // Validate values against restrictions
+                // Si on n'a pas trouvé de variadic, on ne fait rien
+                if (! $foundVariadic) {
+                    // Ne pas ajouter le token à newSignature, il est consommé
+                }
+
+                // Valider les valeurs
                 if ($allowed->isNotEmpty()) {
                     foreach ($values as $value) {
                         if (! $allowed->contains($value)) {
@@ -68,10 +93,11 @@ final class VariadicParser implements ParserInterface
                 continue;
             }
 
-            // Simple variadic (existing logic)
+            // Simple variadic
             if (str_contains($element, '*')) {
                 $name = str_replace('*', '', $element);
                 $values = [];
+                $foundVariadic = false;
 
                 for ($i = $queryIndex; $i < $queryCount; $i++) {
                     $current = $query[$i];
@@ -94,6 +120,7 @@ final class VariadicParser implements ParserInterface
                         }
 
                         $queryIndex = $i + 1;
+                        $foundVariadic = true;
                         break;
                     }
                 }
@@ -102,21 +129,24 @@ final class VariadicParser implements ParserInterface
                     name: $name,
                     values: StringTypedCollection::from($values)
                 );
-            } else {
-                $newSignature[] = $element;
-                if ($queryIndex < $queryCount) {
-                    $newQuery[] = $query[$queryIndex];
-                    $queryIndex++;
-                }
+
+                continue;
+            }
+
+            // Autres éléments (non-variadic)
+            $newSignature[] = $element;
+            if ($queryIndex < $queryCount) {
+                $newQuery[] = $query[$queryIndex];
+                $queryIndex++;
             }
         }
 
+        // Ajouter les tokens restants
         while ($queryIndex < $queryCount) {
             $newQuery[] = $query[$queryIndex];
             $queryIndex++;
         }
 
-        // Retourner un tableau simple [name => values] pour buildRecord()
         return ParsedResultRecord::from([
             'data' => ['variadics' => $this->buildVariadicArray($variadics)],
             'signature' => $newSignature,
@@ -124,12 +154,6 @@ final class VariadicParser implements ParserInterface
         ]);
     }
 
-    /**
-     * Builds the variadic array from VariadicArgumentRecord objects.
-     *
-     * @param  array<VariadicArgumentRecord>  $variadics
-     * @return array<string, array<string>>
-     */
     private function buildVariadicArray(array $variadics): array
     {
         $result = [];
@@ -145,34 +169,26 @@ final class VariadicParser implements ParserInterface
         $errors = new StringTypedCollection;
         $suggestions = new StringTypedCollection;
 
-        $variadicDefinitions = [];
-        $restrictedDefinitions = [];
         $variadicOrder = [];
 
-        foreach ($signature as $index => $element) {
-            // Check for restricted variadic
+        foreach ($signature as $element) {
             if (preg_match(self::PATTERN_RESTRICTED, $element, $matches)) {
                 $name = $matches[1];
                 $allowedString = trim($matches[2]);
                 $allowed = $allowedString !== '' ? array_map('trim', explode(',', $allowedString)) : [];
-                $restrictedDefinitions[$name] = $allowed;
-                $variadicDefinitions[] = $name;
                 $variadicOrder[] = ['name' => $name, 'restricted' => true, 'allowed' => $allowed];
 
                 continue;
             }
 
-            // Simple variadic
             if (str_contains($element, '*')) {
                 $name = str_replace('*', '', $element);
-                $variadicDefinitions[] = $name;
                 $variadicOrder[] = ['name' => $name, 'restricted' => false, 'allowed' => []];
             }
         }
 
-        $hasVariadic = ! empty($variadicDefinitions);
+        $hasVariadic = ! empty($variadicOrder);
 
-        // Extraire tous les tokens variadiques de la query dans l'ordre
         $variadicTokens = [];
         foreach ($query as $element) {
             if (str_starts_with($element, '[') && str_ends_with($element, ']')) {
@@ -187,14 +203,8 @@ final class VariadicParser implements ParserInterface
             $suggestions->add('Add a variadic argument (*) to the signature');
         }
 
-        if ($hasVariadic && ! $hasVariadicInQuery) {
-            $suggestions->add('Variadic argument is defined but not used. Use [value1, value2] format');
-        }
-
-        // Valider chaque variadic individuellement dans l'ordre
         foreach ($variadicOrder as $index => $variadicDef) {
             if (! isset($variadicTokens[$index])) {
-                // Pas de token pour ce variadic, c'est OK (optionnel)
                 continue;
             }
 
@@ -202,13 +212,11 @@ final class VariadicParser implements ParserInterface
             $content = trim($token, '[]');
 
             if (empty($content)) {
-                // Token vide, c'est OK
                 continue;
             }
 
             $parts = array_map('trim', explode(',', $content));
 
-            // Vérifier les valeurs vides
             foreach ($parts as $part) {
                 if (empty($part)) {
                     $errors->add('Empty value in variadic argument');
@@ -217,7 +225,6 @@ final class VariadicParser implements ParserInterface
                 }
             }
 
-            // Valider les restrictions UNIQUEMENT pour ce variadic
             if ($variadicDef['restricted']) {
                 $name = $variadicDef['name'];
                 $allowed = $variadicDef['allowed'];
@@ -261,41 +268,5 @@ final class VariadicParser implements ParserInterface
     public function getTokenPattern(): string
     {
         return '/^([a-zA-Z_][a-zA-Z0-9_]*\*|([a-zA-Z_][a-zA-Z0-9_]*)\*>\s*\[[^\]]*\]\s*)$/';
-    }
-
-    /**
-     * Extract variadic values from query at given index.
-     *
-     * @param  array<int, string>  $query
-     * @return array<string>
-     */
-    private function extractVariadicValues(array $query, int $startIndex): array
-    {
-        $values = [];
-        $queryCount = count($query);
-
-        for ($i = $startIndex; $i < $queryCount; $i++) {
-            $current = $query[$i];
-
-            if (str_starts_with($current, '[') && str_ends_with($current, ']')) {
-                $content = trim($current, '[]');
-                if (! empty($content)) {
-                    $parts = array_map('trim', explode(',', $content));
-                    foreach ($parts as $part) {
-                        if (! empty($part)) {
-                            $values[] = $part;
-                        }
-                    }
-                }
-                break;
-            }
-
-            // Stop if we hit a flag
-            if (str_starts_with($current, '--')) {
-                break;
-            }
-        }
-
-        return $values;
     }
 }
